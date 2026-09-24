@@ -8,6 +8,9 @@ from pycaw.pycaw import AudioUtilities
 import time
 import pyautogui
 import ctypes
+import threading
+import sounddevice as sd
+from openwakeword.model import Model
 
 user32 = ctypes.windll.user32
 pyautogui.FAILSAFE = True
@@ -35,7 +38,6 @@ click_active = False
 
 MODE_NAMES = {0: "STANDBY", 1: "VOLUME", 2: "BRIGHTNESS", 3: "CURSOR", 4: "SHUTDOWN"}
 
-# --- JARVIS color palette (BGR) ---
 GLOW_CYAN = (255, 220, 0)
 GLOW_CYAN_DIM = (120, 90, 0)
 ACCENT = (0, 255, 200)
@@ -52,6 +54,39 @@ right_state = {
 }
 
 left_last_action = None
+
+# ============= WAKE WORD (toggle, no timer) =============
+WAKE_PHRASE = "hey_jarvis"
+WAKE_COOLDOWN = 1.5  # seconds — prevents one utterance from double-triggering the toggle
+
+listening_active = False
+last_wake_time = 0
+wake_lock = threading.Lock()
+
+def wakeword_listener():
+    global listening_active, last_wake_time
+    oww_model = Model(wakeword_models=[WAKE_PHRASE])
+
+    def audio_callback(indata, frames, time_info, status):
+        global listening_active, last_wake_time
+        chunk = indata[:, 0]
+        prediction = oww_model.predict(chunk)
+        if prediction[WAKE_PHRASE] > 0.5:
+            now = time.time()
+            if now - last_wake_time > WAKE_COOLDOWN:
+                with wake_lock:
+                    listening_active = not listening_active
+                last_wake_time = now
+                print(f"Wake word detected — now {'ACTIVE' if listening_active else 'STANDBY'}")
+
+    with sd.InputStream(channels=1, samplerate=16000, blocksize=1280,
+                         dtype='int16', callback=audio_callback):
+        while True:
+            time.sleep(0.1)
+
+threading.Thread(target=wakeword_listener, daemon=True).start()
+
+# ============= HELPERS =============
 
 def set_volume(percent):
     global last_volume
@@ -155,7 +190,6 @@ def adaptive_smooth(new_value, prev_smoothed, distance_moved, slow_alpha=0.15, f
 # ============= JARVIS-STYLE DRAWING HELPERS =============
 
 def draw_glow_skeleton(frame, points, connections):
-    """Dim thick line underneath + bright thin line on top = glow effect."""
     for start, end in connections:
         cv2.line(frame, points[start], points[end], GLOW_CYAN_DIM, 4, cv2.LINE_AA)
         cv2.line(frame, points[start], points[end], GLOW_CYAN, 1, cv2.LINE_AA)
@@ -164,14 +198,12 @@ def draw_glow_skeleton(frame, points, connections):
         cv2.circle(frame, (x, y), 2, GLOW_CYAN, -1, cv2.LINE_AA)
 
 def draw_progress_ring(frame, center, progress, radius=45, color=ACCENT):
-    """progress: 0.0 - 1.0. Draws an arc that fills clockwise."""
     if progress <= 0:
         return
     cv2.ellipse(frame, center, (radius, radius), -90, 0, 360, GLOW_CYAN_DIM, 2, cv2.LINE_AA)
     cv2.ellipse(frame, center, (radius, radius), -90, 0, int(360 * progress), color, 3, cv2.LINE_AA)
 
 def draw_hud_panel(frame, x, y, lines, w=220):
-    """Semi-transparent dark panel with cyan border and text lines."""
     line_h = 26
     panel_h = 20 + line_h * len(lines)
     overlay = frame.copy()
@@ -189,6 +221,15 @@ def draw_corner_brackets(frame, w, h, size=40, color=GLOW_CYAN_DIM, thickness=2)
     for cx, cy, dx, dy in corners:
         cv2.line(frame, (cx, cy), (cx + dx * size, cy), color, thickness, cv2.LINE_AA)
         cv2.line(frame, (cx, cy), (cx, cy + dy * size), color, thickness, cv2.LINE_AA)
+
+def draw_activation_banner(frame, w, active):
+    if active:
+        text = "ACTIVE"
+        color = ACCENT
+    else:
+        text = 'say "Hey JARVIS" to activate'
+        color = GLOW_CYAN_DIM
+    cv2.putText(frame, text, (w // 2 - 140, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
 
 # ============= MAIN =============
 
@@ -229,7 +270,12 @@ while cap.isOpened():
     h, w, _ = frame.shape
     draw_corner_brackets(frame, w, h)
 
-    if result.hand_landmarks:
+    with wake_lock:
+        active_now = listening_active
+
+    draw_activation_banner(frame, w, active_now)
+
+    if result.hand_landmarks and active_now:
         for hand_landmarks, handedness in zip(result.hand_landmarks, result.handedness):
             label = handedness[0].category_name
             label = "Right" if label == "Left" else "Left"
@@ -340,7 +386,6 @@ while cap.isOpened():
                     elif p >= CLICK_THRESH:
                         click_active = False
 
-                # --- HUD panel ---
                 mode_label = MODE_NAMES.get(right_state["mode"], "?")
                 lines = [(f"MODE: {mode_label}", ACCENT)]
                 if right_state["mode"] == 1:
@@ -351,8 +396,10 @@ while cap.isOpened():
 
                 draw_hud_panel(frame, wrist_pt[0] - 60, wrist_pt[1] + 30, lines, w=200)
 
+    elif not active_now:
+        cv2.putText(frame, "STANDBY", (30, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, GLOW_CYAN_DIM, 2, cv2.LINE_AA)
     else:
-        cv2.putText(frame, "NO SIGNAL", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, GLOW_CYAN_DIM, 2, cv2.LINE_AA)
+        cv2.putText(frame, "NO SIGNAL", (30, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, GLOW_CYAN_DIM, 2, cv2.LINE_AA)
 
     cv2.imshow("J.A.R.V.I.S.", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
